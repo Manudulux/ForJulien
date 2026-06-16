@@ -11,16 +11,11 @@ st.set_page_config(layout="wide", page_title="Executive Supply Chain Dashboard")
 st.title("📊 Executive Supply Chain Dashboard")
 
 st.markdown("""
-### Instructions
-1. Upload your SAP datasets:
-   - Manual Accruals
-   - SAP TM
-   - SAP ERP
-2. Use filters to analyze cost drivers and performance
+Upload your SAP datasets and analyze cost drivers, carriers, and performance.
 """)
 
 # =====================================================
-# FILE UPLOAD
+# UPLOAD
 # =====================================================
 st.sidebar.header("Upload Files")
 
@@ -29,40 +24,48 @@ tm_file = st.sidebar.file_uploader("SAP TM", type=["xlsx"])
 erp_file = st.sidebar.file_uploader("SAP ERP", type=["xlsx"])
 
 # =====================================================
+# CACHED LOADERS
+# =====================================================
+@st.cache_data
+def load_excel(file):
+    return pd.read_excel(file, engine="openpyxl")
+
+@st.cache_data
+def load_erp(file):
+    df = pd.read_excel(file, engine="openpyxl")
+
+    # Keep only useful columns
+    keep_cols = [c for c in df.columns if c in ["Material", "Matl Group", "Net value"]]
+    df = df[keep_cols]
+
+    # Reduce size if too large
+    if len(df) > 200000:
+        df = df.sample(200000, random_state=42)
+
+    return df
+
+# =====================================================
 # LOAD DATA
 # =====================================================
-def load_data(accruals_file, tm_file, erp_file):
-    accruals, tm, erp = None, None, None
-
-    if accruals_file:
-        accruals = pd.read_excel(accruals_file, engine="openpyxl")
-
-    if tm_file:
-        tm = pd.read_excel(tm_file, engine="openpyxl")
-
-    if erp_file:
-        erp = pd.read_excel(erp_file, engine="openpyxl")
-
-    return accruals, tm, erp
-
-
-accruals, tm, erp = load_data(accruals_file, tm_file, erp_file)
+accruals = load_excel(accruals_file) if accruals_file else None
+tm = load_excel(tm_file) if tm_file else None
+erp = load_erp(erp_file) if erp_file else None
 
 # =====================================================
-# SAFETY CHECKS
+# SAFETY
 # =====================================================
 if accruals is None:
-    st.warning("Please upload the Manual Accruals file to start.")
+    st.warning("Upload Manual Accruals file to start.")
     st.stop()
 
 if tm is None:
-    st.info("SAP TM not uploaded — transport metrics limited.")
+    st.info("SAP TM not uploaded — limited transport metrics")
 
 if erp is None:
-    st.info("SAP ERP not uploaded — product insights limited.")
+    st.info("SAP ERP not uploaded — limited product insights")
 
 # =====================================================
-# CLEAN / STANDARDIZE
+# CLEANING FUNCTIONS
 # =====================================================
 def safe_rename(df):
     col_map = {
@@ -71,31 +74,45 @@ def safe_rename(df):
     }
     return df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
-
+@st.cache_data
 def parse_euro_number(series):
-    """Convert SAP EU number formats to float"""
     return pd.to_numeric(
         series.astype(str)
-        .str.replace(".", "", regex=False)   # remove thousand separator
-        .str.replace(",", ".", regex=False), # convert decimal
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False),
         errors="coerce"
     )
 
-
-accruals = safe_rename(accruals)
-
-if tm is not None:
-    tm = safe_rename(tm)
-
-if erp is not None:
-    erp = safe_rename(erp)
-
 # =====================================================
-# DATE PARSING
+# PREPARE DATA (CACHED)
 # =====================================================
-for col in accruals.columns:
-    if "Date" in col:
-        accruals[col] = pd.to_datetime(accruals[col], errors="coerce")
+@st.cache_data
+def prepare_data(accruals, tm, erp):
+
+    accruals = safe_rename(accruals)
+
+    # Parse dates once
+    for col in accruals.columns:
+        if "Date" in col:
+            accruals[col] = pd.to_datetime(accruals[col], errors="coerce")
+
+    # TM processing
+    if tm is not None:
+        tm = safe_rename(tm)
+
+        if "Gross Weight" in tm.columns:
+            tm["Gross Weight"] = parse_euro_number(tm["Gross Weight"])
+
+        if "Cost" in tm.columns and "Gross Weight" in tm.columns:
+            tm["Cost_per_kg"] = tm["Cost"] / tm["Gross Weight"].replace(0, np.nan)
+
+    # ERP rename
+    if erp is not None:
+        erp = safe_rename(erp)
+
+    return accruals, tm, erp
+
+accruals, tm, erp = prepare_data(accruals, tm, erp)
 
 # =====================================================
 # FILTERS
@@ -130,7 +147,33 @@ if date_range and "Actual Delivered Date" in df.columns:
     ]
 
 # =====================================================
-# KPI CALCULATION
+# PRE-AGGREGATIONS (CACHED)
+# =====================================================
+@st.cache_data
+def compute_aggregations(df):
+
+    results = {}
+
+    if "Carrier Description" in df.columns:
+        carrier = df.groupby("Carrier Description")["Cost"].agg(["sum", "count"])
+        carrier["cost_per_shipment"] = carrier["sum"] / carrier["count"]
+        results["carrier"] = carrier.sort_values("sum", ascending=False).head(10)
+
+    if "Actual Delivered Date" in df.columns:
+        time = df.groupby(pd.Grouper(key="Actual Delivered Date", freq="W"))["Cost"].sum()
+        results["time"] = time
+
+    if "Carrier Description" in df.columns:
+        total_cost = df.groupby("Carrier Description")["Cost"].sum()
+        results["top_carrier"] = total_cost.idxmax()
+        results["top_cost"] = total_cost.max()
+
+    return results
+
+agg = compute_aggregations(df)
+
+# =====================================================
+# KPIs
 # =====================================================
 total_cost = df["Cost"].sum() if "Cost" in df.columns else 0
 shipments = len(df)
@@ -140,17 +183,8 @@ exec_rate = 0
 if "Execution Status" in df.columns:
     exec_rate = (df["Execution Status"] == "Executed").mean()
 
-# ✅ FIXED €/kg calculation
-avg_cost_per_kg = 0
+avg_cost_per_kg = tm["Cost_per_kg"].mean() if tm is not None and "Cost_per_kg" in tm else 0
 
-if tm is not None and "Cost" in tm.columns and "Gross Weight" in tm.columns:
-    tm["Gross Weight"] = parse_euro_number(tm["Gross Weight"])
-    tm["Cost_per_kg"] = tm["Cost"] / tm["Gross Weight"].replace(0, np.nan)
-    avg_cost_per_kg = tm["Cost_per_kg"].mean()
-
-# =====================================================
-# KPI DISPLAY
-# =====================================================
 col1, col2, col3, col4, col5 = st.columns(5)
 
 col1.metric("Total Cost", f"€{total_cost:,.0f}")
@@ -164,110 +198,82 @@ col5.metric("Avg €/kg", f"{avg_cost_per_kg:.2f}")
 # =====================================================
 st.subheader("💸 Cost Drivers")
 
-possible_cols = [c for c in ["Carrier Description", "Incoterm", "Ob Sales Org ID"] if c in df.columns]
-
-if possible_cols:
-    group_col = st.selectbox("Break cost by", possible_cols)
-
-    cost_driver = df.groupby(group_col)["Cost"].sum().sort_values(ascending=False).head(10)
-
+if "carrier" in agg:
     fig = px.bar(
-        x=cost_driver.index,
-        y=cost_driver.values,
-        labels={"x": group_col, "y": "Cost"}
+        agg["carrier"],
+        x=agg["carrier"].index,
+        y="sum"
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
-# NETWORK VIEW
+# NETWORK
 # =====================================================
 if "Source Location Description" in df.columns and "Destination Location Descripti" in df.columns:
+
     st.subheader("🌍 Top Routes")
 
     df["Route"] = df["Source Location Description"] + " → " + df["Destination Location Descripti"]
+    route_df = df.groupby("Route")["Cost"].sum().sort_values(ascending=False).head(15)
 
-    routes = df.groupby("Route")["Cost"].sum().sort_values(ascending=False).head(15)
-
-    fig = px.bar(routes, orientation="h")
+    fig = px.bar(route_df, orientation="h")
     st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
 # CARRIER PERFORMANCE
 # =====================================================
-if "Carrier Description" in df.columns:
+if "carrier" in agg:
     st.subheader("🚚 Carrier Performance")
 
-    carrier_perf = df.groupby("Carrier Description").agg(
-        total_cost=("Cost", "sum"),
-        shipments=("Cost", "count")
-    )
-
-    carrier_perf["cost_per_shipment"] = carrier_perf["total_cost"] / carrier_perf["shipments"]
-
-    carrier_perf = carrier_perf.sort_values("total_cost", ascending=False).head(10)
-
     fig = px.scatter(
-        carrier_perf,
-        x="shipments",
+        agg["carrier"],
+        x="count",
         y="cost_per_shipment",
-        size="total_cost",
-        text=carrier_perf.index
+        size="sum",
+        hover_name=agg["carrier"].index
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
-# ERP PRODUCT ANALYSIS
+# ERP ANALYSIS
 # =====================================================
 if erp is not None and "NetValue" in erp.columns:
 
-    st.subheader("📦 Product Analysis")
+    st.subheader("📦 Product Value")
 
-    cols = [c for c in ["Matl Group", "Material"] if c in erp.columns]
+    group_col = st.selectbox("Group by", [c for c in ["Matl Group", "Material"] if c in erp.columns])
 
-    if cols:
-        group_col = st.selectbox("Group ERP data by", cols)
+    erp_group = erp.groupby(group_col)["NetValue"].sum().nlargest(10)
 
-        erp_group = erp.groupby(group_col)["NetValue"].sum().nlargest(10)
-
-        fig = px.bar(erp_group)
-        st.plotly_chart(fig, use_container_width=True)
+    fig = px.bar(erp_group)
+    st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
-# SCENARIO SIMULATION
+# SIMULATOR
 # =====================================================
-if "Carrier Description" in df.columns:
+if "top_cost" in agg:
     st.subheader("🧮 Cost Optimization")
-
-    carrier_cost = df.groupby("Carrier Description")["Cost"].sum()
-
-    top_carrier = carrier_cost.idxmax()
-    top_cost = carrier_cost.max()
 
     reduction = st.slider("Reduce top carrier cost (%)", 0, 30, 10)
 
-    savings = top_cost * reduction / 100
+    savings = agg["top_cost"] * reduction / 100
 
     st.metric("Estimated Savings", f"€{savings:,.0f}")
-    st.info(f"Top carrier: {top_carrier}")
+    st.info(f"Top carrier: {agg['top_carrier']}")
 
 # =====================================================
-# TIME SERIES
+# TREND
 # =====================================================
-if "Actual Delivered Date" in df.columns:
+if "time" in agg:
     st.subheader("📈 Cost Trend")
-
-    time_df = df.groupby(pd.Grouper(key="Actual Delivered Date", freq="W"))["Cost"].sum()
-
-    fig = px.line(time_df)
+    fig = px.line(agg["time"])
     st.plotly_chart(fig, use_container_width=True)
 
 # =====================================================
 # DATA TABLE
 # =====================================================
 st.subheader("🔍 Data")
-
 st.dataframe(df, use_container_width=True)
+
 
 
